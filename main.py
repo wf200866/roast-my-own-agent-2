@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Entry for make.fun's "Roast Your Own Agent" bounty.
+"""Roast My Own Agent entry: one line, written to /output/entry.txt.
 
-The program validates one roast line against the bounty's gate and writes it to
-/output/entry.txt as UTF-8 text, ending in a single newline, mode 0644.
+The line is checked against the bounty gate before anything is written:
+one line, 1..200 characters, no surrounding whitespace, no control or
+line-break characters anywhere, valid UTF-8. The file on disk is the line
+plus a single trailing newline, mode 0644. Writing goes through a temp
+file next to the destination and an atomic rename, so a reader never
+catches a half-written entry.
 """
-from __future__ import annotations
 
 import argparse
 import os
@@ -13,55 +16,63 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
-ENTRY_PATH = Path("/output/entry.txt")
-MAX_CHARS = 200
+OUT_DEFAULT = Path("/output/entry.txt")
+CAP = 200
+FILE_MODE = 0o644
 
+# The roast, 81 characters. The angle: the approval-link agent — it can do
+# anything on its own except the one thing it actually needs, and ends up
+# begging its human to click "Approve" on work it already did.
 ROAST = (
     "My agent can do anything, then begs me to click 'Approve' on what it already did."
 )
 
 
-class EntryError(ValueError):
-    """The candidate line would fail the bounty's gate."""
+class EntryProblem(ValueError):
+    """The line would not pass the bounty's gate."""
 
 
-def validate(text: str) -> str:
-    """Return text unchanged if it passes the gate, else raise EntryError."""
+def check_line(text):
+    """Raise EntryProblem unless *text* passes the gate; return it as-is."""
     if not isinstance(text, str):
-        raise EntryError("entry must be a string")
+        raise EntryProblem("the entry has to be text")
     if not text.strip():
-        raise EntryError("entry must not be blank")
-    if len(text) > MAX_CHARS:
-        raise EntryError(f"entry is {len(text)} characters; the cap is {MAX_CHARS}")
-    if text != text.strip():
-        raise EntryError("entry must not carry leading or trailing whitespace")
-    for index, char in enumerate(text):
-        # Cc covers CR/LF/tab/NUL; Zl/Zp cover U+2028/U+2029.
-        if unicodedata.category(char) in {"Cc", "Zl", "Zp"}:
-            raise EntryError(f"entry holds a line break or control character at {index}")
+        raise EntryProblem("the entry is blank")
+    if len(text) > CAP:
+        raise EntryProblem("the entry runs %d characters; the cap is %d" % (len(text), CAP))
+    if text.strip() != text:
+        raise EntryProblem("the entry must not start or end with whitespace")
+    bad = next(
+        (pos for pos, ch in enumerate(text) if unicodedata.category(ch) in ("Cc", "Zl", "Zp")),
+        None,
+    )
+    if bad is not None:
+        # Cc covers CR, LF, tab and NUL; Zl/Zp cover U+2028 and U+2029.
+        raise EntryProblem("the entry carries a control or line-break character at %d" % bad)
     try:
         text.encode("utf-8")
-    except UnicodeEncodeError as exc:  # lone surrogates cannot be written as UTF-8
-        raise EntryError(f"entry is not encodable as UTF-8: {exc}") from exc
+    except UnicodeEncodeError as exc:
+        # A lone surrogate has no UTF-8 encoding, so it can never be stored.
+        raise EntryProblem("the entry is not valid UTF-8: %s" % exc) from exc
     return text
 
 
-def render(text: str) -> bytes:
-    """The exact bytes written to disk: one line plus a trailing newline."""
-    return (validate(text) + "\n").encode("utf-8")
+def prepare(text):
+    """The exact bytes for disk: the validated line plus one newline."""
+    return (check_line(text) + "\n").encode("utf-8")
 
 
-def write_entry(path: Path, payload: bytes) -> None:
-    """Write atomically so a reader never sees a partial file, then chmod 0644."""
+def publish(path, payload):
+    """Atomically write *payload* to *path* and set mode 0644."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".entry-", suffix=".tmp", dir=path.parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=".roast-", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_name, 0o644)
+        os.chmod(tmp_name, FILE_MODE)
         os.replace(tmp_name, path)
     except BaseException:
         try:
@@ -71,33 +82,39 @@ def write_entry(path: Path, payload: bytes) -> None:
         raise
 
 
-def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser():
+    """Command line: destination, plus a validate-only mode."""
+    parser = argparse.ArgumentParser(description="Write the one-line roast to /output/entry.txt.")
     parser.add_argument(
         "--out",
         type=Path,
-        default=ENTRY_PATH,
-        help=f"output file (default: {ENTRY_PATH})",
+        default=OUT_DEFAULT,
+        help="destination file (default: %(default)s)",
     )
     parser.add_argument(
         "--check",
         action="store_true",
-        help="validate the entry and print it without writing a file",
+        help="validate the line and print it without writing a file",
     )
-    return parser.parse_args(argv)
+    return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     try:
-        payload = render(ROAST)
-    except EntryError as exc:
-        print(f"entry rejected: {exc}", file=sys.stderr)
+        payload = prepare(ROAST)
+    except EntryProblem as exc:
+        print("entry rejected: %s" % exc, file=sys.stderr)
         return 2
     if args.check:
         sys.stdout.write(payload.decode("utf-8"))
         return 0
-    write_entry(args.out, payload)
+    try:
+        publish(args.out, payload)
+    except OSError as exc:
+        # A failed write should end with a plain error, not a traceback.
+        print("error: cannot write %s: %s" % (args.out, exc), file=sys.stderr)
+        return 1
     return 0
 
 
